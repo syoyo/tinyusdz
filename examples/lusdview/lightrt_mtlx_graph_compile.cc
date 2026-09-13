@@ -2210,7 +2210,8 @@ bool CompileMaterialXGraphRuntime(DrawMaterialCPU* mat, std::string* err) {
       {"volume_density",40},{"volume_albedo",41},
       {"volume_emission_color",42},{"volume_emission_scale",43},
       {"emission_luminance",44},{"coat_affect_color",45},
-      {"coat_affect_roughness",46},{"coat_darkening",47}};
+      {"coat_affect_roughness",46},{"coat_darkening",47},
+      {"subsurface_scatter_anisotropy",48}};
   int subsurfaceRadiusScaleNode = -1;
   if (connIt != j.end() && connIt->is_array()) {
     for (const nlohmann::json& connection : *connIt) {
@@ -2285,9 +2286,10 @@ bool CompileMaterialXGraphRuntime(DrawMaterialCPU* mat, std::string* err) {
       else if (input == "transmission_scatter_anisotropy")
         destination = &graph.output[24];
       else if (input == "subsurface_scale") destination = &graph.output[25];
-      else if (input == "subsurface_anisotropy" ||
-               input == "subsurface_scatter_anisotropy")
+      else if (input == "subsurface_anisotropy")
         destination = &graph.output[26];
+      else if (input == "subsurface_scatter_anisotropy")
+        destination = &graph.output[48];
       else if (input == "coat_ior") destination = &graph.output[27];
       else if (input == "thin_film_weight") destination = &graph.output[28];
       else if (input == "thin_film_thickness") destination = &graph.output[29];
@@ -2333,10 +2335,6 @@ bool CompileMaterialXGraphRuntime(DrawMaterialCPU* mat, std::string* err) {
   // graph into dependency-first order here so runtime evaluation never needs
   // the old 64x64 fixed-point fallback (a severe NVRTC/Vulkan driver-JIT cost).
   // Cyclic MaterialX graphs are malformed and keep the caller's bake fallback.
-  if (graph.nodes.size() > kRtMaterialGraphMaxNodes) {
-    if (err) *err = "MaterialX graph exceeds the 64-node runtime limit";
-    return false;
-  }
   std::vector<unsigned char> visit(graph.nodes.size(), 0);
   std::vector<int> order;
   order.reserve(graph.nodes.size());
@@ -2354,8 +2352,17 @@ bool CompileMaterialXGraphRuntime(DrawMaterialCPU* mat, std::string* err) {
     order.push_back(index);
     return true;
   };
-  for (size_t i = 0; i < graph.nodes.size(); ++i) {
-    if (!emitDependencyFirst(static_cast<int>(i))) {
+  // Only nodes reachable from a MaterialX/OpenPBR surface output are needed
+  // by the raster and RT surface interpreters.  Older versions walked every
+  // node in the JSON document, which made unused authoring helpers consume the
+  // fixed 64-node budget and inflated every per-fragment graph evaluation.
+  std::vector<int> roots;
+  roots.reserve(graph.output.size());
+  for (int output : graph.output) {
+    if (output >= 0) roots.push_back(output);
+  }
+  for (int root : roots) {
+    if (!emitDependencyFirst(root)) {
       if (err) *err = "MaterialX graph contains a dependency cycle";
       return false;
     }
@@ -2366,6 +2373,10 @@ bool CompileMaterialXGraphRuntime(DrawMaterialCPU* mat, std::string* err) {
   for (int oldIndex : order) {
     oldToNew[static_cast<size_t>(oldIndex)] = static_cast<int>(sorted.size());
     sorted.push_back(std::move(graph.nodes[static_cast<size_t>(oldIndex)]));
+  }
+  if (sorted.size() > kRtMaterialGraphMaxNodes) {
+    if (err) *err = "MaterialX graph exceeds the 64-node runtime limit";
+    return false;
   }
   for (MaterialXGraphNodeCPU& node : sorted) {
     for (int& input : node.input)

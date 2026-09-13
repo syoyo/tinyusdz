@@ -90,21 +90,37 @@ elif command -v spirv-val >/dev/null 2>&1 &&
   RAYTRACE_VALID=0
 fi
 
+# glslc does not provide glslang's --vn symbol option. Its C initializer is a
+# word-aligned fallback that keeps generated ray-query modules compact and
+# matches vkCreate*Pipeline's pCode contract.
+emitGlslcCHeader() {
+  local compiler="$1"
+  local symbol="$2"
+  local output="$3"
+  shift 3
+  local initializer="${output}.initializer"
+  rm -f "$initializer"
+  "$compiler" "$@" -mfmt=c -o "$initializer"
+  {
+    printf '#pragma once\nconst uint32_t %s[] =\n' "$symbol"
+    cat "$initializer"
+    printf ';\n'
+  } > "$output"
+  rm -f "$initializer"
+}
+
 if [ "$RAYTRACE_VALID" -eq 1 ] &&
    "$GLSLANG" -V --target-env vulkan1.2 "$RT_SHADER_DEFINE" --vn raytrace_comp_spv \
       -o "$OUT/raytrace_comp.spv.h" "$HERE/raytrace.comp" 2>/dev/null; then
   echo "==> raytrace.comp -> embedded/raytrace_comp.spv.h (ray query ENABLED)"
 else
   # glslc can support ray-query even when the installed glslangValidator is
-  # too old. Emit a byte header and let createShader consume its byte size;
-  # Vulkan requires pCode to be 4-byte aligned, which SPIR-V already is.
+  # too old. Emit a compact word-aligned C header.
   GLSLC="${GLSLC:-$(command -v glslc || true)}"
   if [ -n "$GLSLC" ] && [ -x "$GLSLC" ] &&
      "$GLSLC" --target-env=vulkan1.2 "$RT_SHADER_DEFINE" -o "$RAYTRACE_TMP" "$HERE/raytrace.comp"; then
-    xxd -i -c 12 "$RAYTRACE_TMP" "$OUT/raytrace_comp.spv.h"
-    sed -i 's/unsigned char _tmp_.*_spv\[\]/const unsigned char raytrace_comp_spv[]/' "$OUT/raytrace_comp.spv.h"
-    sed -i 's/unsigned int _tmp_.*_spv_len/const unsigned int raytrace_comp_spv_len/' "$OUT/raytrace_comp.spv.h"
-    sed -i '1i#pragma once' "$OUT/raytrace_comp.spv.h"
+    emitGlslcCHeader "$GLSLC" raytrace_comp_spv "$OUT/raytrace_comp.spv.h" \
+      --target-env=vulkan1.2 "$RT_SHADER_DEFINE" "$HERE/raytrace.comp"
     echo "==> raytrace.comp -> embedded/raytrace_comp.spv.h (ray query ENABLED via glslc)"
   else
     rm -f "$OUT/raytrace_comp.spv.h"
@@ -131,10 +147,11 @@ if [ -n "$GLSLC_FAST" ] && [ -x "$GLSLC_FAST" ] &&
       -DLUSDVIEW_RT_DISABLE_MTLX=1 -DLUSDVIEW_RT_DISABLE_DEBUG_RAYS=1 \
       -o "$RAYTRACE_FAST_TMP" \
       "$HERE/raytrace.comp"; then
-  xxd -i -c 12 "$RAYTRACE_FAST_TMP" "$OUT/raytrace_fast_comp.spv.h"
-  sed -i 's/unsigned char _tmp_.*_spv\[\]/const unsigned char raytrace_fast_comp_spv[]/' "$OUT/raytrace_fast_comp.spv.h"
-  sed -i 's/unsigned int _tmp_.*_spv_len/const unsigned int raytrace_fast_comp_spv_len/' "$OUT/raytrace_fast_comp.spv.h"
-  sed -i '1i#pragma once' "$OUT/raytrace_fast_comp.spv.h"
+  emitGlslcCHeader "$GLSLC_FAST" raytrace_fast_comp_spv \
+    "$OUT/raytrace_fast_comp.spv.h" --target-env=vulkan1.2 \
+    "$RT_SHADER_DEFINE" -DLUSDVIEW_RT_FAST_MATERIAL=1 \
+    -DLUSDVIEW_RT_DISABLE_MTLX=1 -DLUSDVIEW_RT_DISABLE_DEBUG_RAYS=1 \
+    "$HERE/raytrace.comp"
   echo "==> raytrace.comp (graph-free) -> embedded/raytrace_fast_comp.spv.h"
 else
   rm -f "$OUT/raytrace_fast_comp.spv.h"
@@ -152,13 +169,11 @@ if [ -n "$GLSLC_FAST" ] && [ -x "$GLSLC_FAST" ] &&
       -DLUSDVIEW_RT_DISABLE_MTLX=1 -DLUSDVIEW_RT_DISABLE_DEBUG_RAYS=1 \
       -DLUSDVIEW_RT_INTERACTIVE_ONLY=1 \
       -o "$RAYTRACE_INTERACTIVE_TMP" "$HERE/raytrace.comp"; then
-  xxd -i -c 12 "$RAYTRACE_INTERACTIVE_TMP" \
-    "$OUT/raytrace_interactive_comp.spv.h"
-  sed -i 's/unsigned char _tmp_.*_spv\[\]/const unsigned char raytrace_interactive_comp_spv[]/' \
-    "$OUT/raytrace_interactive_comp.spv.h"
-  sed -i 's/unsigned int _tmp_.*_spv_len/const unsigned int raytrace_interactive_comp_spv_len/' \
-    "$OUT/raytrace_interactive_comp.spv.h"
-  sed -i '1i#pragma once' "$OUT/raytrace_interactive_comp.spv.h"
+  emitGlslcCHeader "$GLSLC_FAST" raytrace_interactive_comp_spv \
+    "$OUT/raytrace_interactive_comp.spv.h" --target-env=vulkan1.2 \
+    "$RT_SHADER_DEFINE" -DLUSDVIEW_RT_FAST_MATERIAL=1 \
+    -DLUSDVIEW_RT_DISABLE_MTLX=1 -DLUSDVIEW_RT_DISABLE_DEBUG_RAYS=1 \
+    -DLUSDVIEW_RT_INTERACTIVE_ONLY=1 "$HERE/raytrace.comp"
   echo "==> raytrace.comp (interactive-only) -> embedded/raytrace_interactive_comp.spv.h"
 else
   rm -f "$OUT/raytrace_interactive_comp.spv.h"

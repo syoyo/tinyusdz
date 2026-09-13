@@ -611,8 +611,9 @@ struct MaterialXGraphRuntimeCPU {
   // emission, normal, subsurface weight/color/radius, specular weight/color,
   // transmission weight/color, coat weight/color/roughness, sheen
   // weight/color/roughness, specular IOR, and the advanced OpenPBR controls
-  // through volume emission scale. -1 means no graph connection.
-  static constexpr int kOutputCount = 48;
+  // through volume emission scale. Route 48 is the distinct
+  // subsurface-scatter-anisotropy lane; -1 means no graph connection.
+  static constexpr int kOutputCount = 49;
   std::array<int, kOutputCount> output = [] {
     std::array<int, kOutputCount> routes{};
     routes.fill(-1);

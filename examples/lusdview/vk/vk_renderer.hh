@@ -922,6 +922,12 @@ class VulkanRenderer final : public Renderer {
   VkDeviceMemory dispMatSsboMem_{VK_NULL_HANDLE};
   void* dispMatMapped_{nullptr};
   size_t dispMatCapacity_{0};
+  // Backend-neutral OpenPBR constants for the raster fragment path. The packet
+  // is indexed by the same canonical material id as dispMatSsbo_ and remains
+  // persistently mapped so live material edits do not rebuild descriptors.
+  VkBuffer rasterMatPbrBuf_{VK_NULL_HANDLE};
+  VkDeviceMemory rasterMatPbrMem_{VK_NULL_HANDLE};
+  void* rasterMatPbrMapped_{nullptr};
   // Set 3 of the instanced pipeline: per-draw metadata (meshId + flag bits), one
   // entry per mesh plus a trailing slot for the shared box proxy. The fragment
   // shader indexes it by (baseDraw + gl_DrawIDARB), so a multi-draw-indirect batch
@@ -1142,6 +1148,7 @@ class VulkanRenderer final : public Renderer {
   std::vector<float> matLightRt_;  // 14 vec4 per material: LightRT/OpenPBR block
   std::vector<float> matGraph_;    // fixed-size MaterialX graph runtime blocks
   std::vector<float> rasterMatGraph_; // local image slots for raster graph evaluation
+  std::vector<float> rasterMatPbr_; // canonical 20-vec4 OpenPBR raster packet
   std::vector<float> lightParams_;  // packed DrawLightCPU params
   std::vector<uint32_t> rtDirectLightMasks_;
   std::vector<uint32_t> rtShadowLightMasks_;
@@ -1291,6 +1298,8 @@ class VulkanRenderer final : public Renderer {
   VkDeviceMemory rtMatGraphMem_{VK_NULL_HANDLE};
   VkBuffer rasterMatGraphBuf_{VK_NULL_HANDLE};
   VkDeviceMemory rasterMatGraphMem_{VK_NULL_HANDLE};
+  void* rasterMatGraphMapped_{nullptr};
+  size_t rasterMatGraphCapacity_{0};
   VkDeviceSize rtMatCap_{0};
   VkBuffer instInfoBuf_{VK_NULL_HANDLE};    // per-TLAS-instance {meshId, tint} (binding 4)
   VkDeviceMemory instInfoMem_{VK_NULL_HANDLE};

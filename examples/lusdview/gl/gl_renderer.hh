@@ -250,6 +250,7 @@ class GLRenderer final : public Renderer {
   GLint uCoatRoughness_{-1}, uCoatIor_{-1};
   GLint uTransmission_{-1}, uTransmissionColor_{-1};
   GLint uTransmissionDepth_{-1}, uTransmissionScatter_{-1};
+  GLint uTransmissionScatterAnisotropy_{-1};
   GLint uVolumeDensity_{-1}, uVolumeAlbedo_{-1};
   GLint uVolumeEmission_{-1}, uVolumeEmissionScale_{-1};
   GLint uDiffuseRoughness_{-1};
@@ -315,12 +316,12 @@ class GLRenderer final : public Renderer {
   GLint uAdvancedUdimSlots_{-1};
   GLint uCoatNormalTexIsUdim_{-1}, uCoatNormalUdimRoute_{-1};
   GLint uCoatNormalUdimSlot_{-1};
-  GLint uGraphNodeCount_{-1}, uGraphOutputs0_{-1}, uGraphOutputs1_{-1},
-      uGraphOutputs2_{-1}, uGraphOutputs3_{-1};
+  GLint uGraphNodeCount_{-1}, uGraphOutputs_{-1};
   GLint uGraphUsable_{-1};
   GLint uGraphNode0_{-1}, uGraphNode1_{-1}, uGraphNode2_{-1};
   GLint uGraphNode3_{-1}, uGraphNode4_{-1}, uGraphNode5_{-1};
   GLint uGraphTex_[8]{-1, -1, -1, -1, -1, -1, -1, -1};
+  GLint uGraphUdimRoutes_{-1};
   GLint uUdimSlots_{-1}, uOpacityUdimSlot_{-1}, uRoughnessUdimSlot_{-1};
   GLint uOcclusionUdimSlot_{-1};
   GLint uHasDisplacement_{-1}, uHasDisplacementTex_{-1};  // displacement (coarse)
@@ -414,7 +415,8 @@ class GLRenderer final : public Renderer {
   RasterPointShadowCameras pointShadowCameras_;
   void destroyIblTextures();
 
-  GLuint whiteTex_{0}, boneTex_{0};
+  GLuint whiteTex_{0};
+  GLuint boneTex_{0};
   int boneTexWidth_{0}, boneTexHeight_{0}, boneMatrixCount_{0};
   int maxTextureSize_{4096};
   float maxTextureAnisotropy_{1.0f};

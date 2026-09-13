@@ -102,8 +102,8 @@ void UploadRasterLightArray(GLuint program, const RasterLightSet& lights) {
 
 void UploadRasterLightMask(GLuint program, const RasterLightSet& lights,
                            int meshIndex) {
-  glUniform1ui(glGetUniformLocation(program, "uLightMask"),
-               RasterLightMaskForMesh(lights, meshIndex));
+  const uint32_t mask = RasterLightMaskForMesh(lights, meshIndex);
+  glUniform1ui(glGetUniformLocation(program, "uLightMask"), mask);
 }
 
 void UploadRasterLightMaskValue(GLuint program, uint32_t mask) {
@@ -261,8 +261,18 @@ bool GLRenderer::init(GLFWwindow* window, std::string* err) {
     caps_.supportsETC2 = has("GL_ARB_ES3_compatibility") || GLAD_GL_VERSION_4_3;
   }
 
-  program_ = glutil::CompileProgram(light3d::getMaterialVertexShaderGL330(),
-                                    light3d::getMaterialFragmentShaderGL330(), err);
+  // The complete graph interpreter is intentionally kept for capable hardware,
+  // but software GL drivers are disproportionately sensitive to the register
+  // pressure from its 64-node arrays plus the full OpenPBR lobe stack. The
+  // compact path retains the baked MaterialX semantic lanes and shared direct
+  // light packet, so llvmpipe/softpipe get deterministic raster output without
+  // sacrificing the high-feature path on hardware GL.
+  const bool useCompactMaterial = caps_.device_type == "cpu";
+  program_ = glutil::CompileProgram(
+      light3d::getMaterialVertexShaderGL330(),
+      useCompactMaterial ? light3d::getMaterialFragmentShaderGL330Fallback()
+                          : light3d::getMaterialFragmentShaderGL330(),
+      err);
   if (!program_) {
     // Low-sampler GL implementations (notably software Mesa) can reject the
     // full MaterialX/OpenPBR shader before scene initialization. Keep the
@@ -373,10 +383,7 @@ bool GLRenderer::init(GLFWwindow* window, std::string* err) {
   uCoatNormalUdimSlot_ =
       glGetUniformLocation(program_, "uCoatNormalUdimSlot");
   uGraphNodeCount_ = glGetUniformLocation(program_, "uGraphNodeCount");
-  uGraphOutputs0_ = glGetUniformLocation(program_, "uGraphOutputs0");
-  uGraphOutputs1_ = glGetUniformLocation(program_, "uGraphOutputs1");
-  uGraphOutputs2_ = glGetUniformLocation(program_, "uGraphOutputs2");
-  uGraphOutputs3_ = glGetUniformLocation(program_, "uGraphOutputs3");
+  uGraphOutputs_ = glGetUniformLocation(program_, "uGraphOutputs[0]");
   uGraphUsable_ = glGetUniformLocation(program_, "uGraphUsable");
   uGraphNode0_ = glGetUniformLocation(program_, "uGraphNode0");
   uGraphNode1_ = glGetUniformLocation(program_, "uGraphNode1");
@@ -392,6 +399,7 @@ bool GLRenderer::init(GLFWwindow* window, std::string* err) {
     // even when the graph route is disabled.
     if (uGraphTex_[i] >= 0) glUniform1i(uGraphTex_[i], 33 + i);
   }
+  uGraphUdimRoutes_ = glGetUniformLocation(program_, "uGraphUdimRoutes[0]");
   uCoatWeight_ = glGetUniformLocation(program_, "uCoatWeight");
   uCoatColor_ = glGetUniformLocation(program_, "uCoatColor");
   uCoatRoughness_ = glGetUniformLocation(program_, "uCoatRoughness");
@@ -400,6 +408,8 @@ bool GLRenderer::init(GLFWwindow* window, std::string* err) {
   uTransmissionColor_ = glGetUniformLocation(program_, "uTransmissionColor");
   uTransmissionDepth_ = glGetUniformLocation(program_, "uTransmissionDepth");
   uTransmissionScatter_ = glGetUniformLocation(program_, "uTransmissionScatter");
+  uTransmissionScatterAnisotropy_ =
+      glGetUniformLocation(program_, "uTransmissionScatterAnisotropy");
   uVolumeDensity_ = glGetUniformLocation(program_, "uVolumeDensity");
   uVolumeAlbedo_ = glGetUniformLocation(program_, "uVolumeAlbedo");
   uVolumeEmission_ = glGetUniformLocation(program_, "uVolumeEmission");
@@ -986,7 +996,6 @@ void main() {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   glBindTexture(GL_TEXTURE_2D, 0);
-
   glGenTextures(1, &boneTex_);
   glBindTexture(GL_TEXTURE_2D, boneTex_);
   const float ident[16] = {
@@ -2161,9 +2170,6 @@ void GLRenderer::destroyIblTextures() {
 void GLRenderer::setLights(const std::vector<DrawLightCPU>& lights,
                            size_t meshCount) {
   rasterLights_ = PackRasterLights(lights, meshCount);
-  if (std::getenv("LUSDVIEW_DEBUG_LIGHTS"))
-    std::fprintf(stderr, "[raster-lights] GL source=%zu direct=%d meshes=%zu\n",
-                 lights.size(), rasterLights_.count, meshCount);
   if (rasterLights_.truncated > 0) {
     std::fprintf(stderr,
                  "[lusdview] raster lighting: evaluating first %d direct lights; "
@@ -2573,11 +2579,9 @@ void GLRenderer::appendMeshImpl(const DrawMeshCPU& sm, bool includeAux) {
   gm.rasterDisplacementBaked = sm.rasterDisplacementBaked;
   gm.purposeId = PurposeId(sm.purpose);
   gm.kindId = sm.kindId;
-  // Per-vertex displayColor (divisor 0). Non-instanced meshes bind it at attrib 9
-  // (the shared material shader's aColor); instanced meshes bind it at attrib 10
-  // (the instanced shader multiplies per-vertex x per-instance color, since attrib
-  // 9 there carries the per-instance color set below). Default white (set per draw)
-  // when absent so the base color is unmodulated.
+  // Per-vertex displayColor/displayOpacity. Non-instanced material draws use
+  // attrib 9; instanced meshes use attrib 10 because attrib 9 carries the
+  // per-instance color in the separate flat shader.
   const bool gmInstanced = !sm.instanceXforms.empty();
   const GLuint vtxColorAttrib = gmInstanced ? 10u : 9u;
   const bool hasVtxColor = sm.vertexColors.size() == sm.vertices.size() * 3;
@@ -2607,13 +2611,24 @@ void GLRenderer::appendMeshImpl(const DrawMeshCPU& sm, bool includeAux) {
                  static_cast<GLsizeiptr>(rgba.size() * sizeof(float)),
                  rgba.data(), GL_STATIC_DRAW);
     glEnableVertexAttribArray(vtxColorAttrib);
-    glVertexAttribPointer(vtxColorAttrib, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
-                          (void*)0);
+    glVertexAttribPointer(vtxColorAttrib, 4, GL_FLOAT, GL_FALSE,
+                          4 * sizeof(float), (void*)0);
     glVertexAttribDivisor(vtxColorAttrib, 0);
   } else {
-    glDisableVertexAttribArray(vtxColorAttrib);  // constant white set per draw
+    if (gmInstanced) {
+      // The instanced shader consumes this as a per-vertex value at location 10.
+      // A one-element divisor-0 array would run out of bounds on every vertex;
+      // the disabled-array generic value is constant across all instances.
+      glDisableVertexAttribArray(vtxColorAttrib);
+      glVertexAttrib4f(vtxColorAttrib, 1.0f, 1.0f, 1.0f, 1.0f);
+    } else {
+      // A disabled array's generic value is constant for every vertex and is
+      // recorded in the mesh VAO while it is bound here. This avoids an
+      // out-of-range fetch from a one-element divisor-0 stream.
+      glDisableVertexAttribArray(vtxColorAttrib);
+      glVertexAttrib4f(vtxColorAttrib, 1.0f, 1.0f, 1.0f, 1.0f);
+    }
   }
-
   // Multi-UV (attrib 6) + blendshape influence (attrib 7), non-instanced only --
   // instanced meshes reuse attribs 6-8 for the per-instance rows (separate
   // program). Default 0 when the mesh lacks the data so modes read as zero.
@@ -3343,9 +3358,6 @@ void GLRenderer::drawMeshes(const RenderFrameParams& params, bool wireframe,
       glBindTexture(GL_TEXTURE_BUFFER, mesh.faceIdTex);
       glActiveTexture(GL_TEXTURE0);
     }
-    // Default per-vertex color to white when the mesh has none (so uBaseColor is
-    // unmodulated); the VAO supplies the array when vertexColorVbo is set.
-    if (!mesh.vertexColorVbo) glVertexAttrib4f(9, 1.0f, 1.0f, 1.0f, 1.0f);
     const bool skinOn = mesh.skinned && skinningFrameEnabled_;
     glUniform1i(uSkinningEnabled_, skinOn ? 1 : 0);
     glUniform1i(uExtendedSkinningEnabled_,
@@ -3386,6 +3398,12 @@ void GLRenderer::drawMeshes(const RenderFrameParams& params, bool wireframe,
     }
 
     glBindVertexArray(mesh.vao);
+    if (!mesh.vertexColorVbo) {
+      // Generic attribute values are context state rather than VAO state on
+      // several GL implementations. Re-assert the white fallback after the
+      // mesh VAO is bound so a preceding instanced draw cannot leak its color.
+      glVertexAttrib4f(9, 1.0f, 1.0f, 1.0f, 1.0f);
+    }
     for (const auto& sub : mesh.submeshes) {
       const bool splitBack =
           !wireframe && sub.backfaceMaterialId >= 0 &&
@@ -3554,6 +3572,7 @@ void GLRenderer::drawMeshes(const RenderFrameParams& params, bool wireframe,
         glUniform3f(uTransmissionColor_, 1.0f, 1.0f, 1.0f);
         glUniform1f(uTransmissionDepth_, 0.0f);
         glUniform3f(uTransmissionScatter_, 0.0f, 0.0f, 0.0f);
+        glUniform1f(uTransmissionScatterAnisotropy_, 0.0f);
         glUniform1f(uVolumeDensity_, 0.0f);
         glUniform3f(uVolumeAlbedo_, 1.0f, 1.0f, 1.0f);
         glUniform3f(uVolumeEmission_, 0.0f, 0.0f, 0.0f);
@@ -3636,6 +3655,8 @@ void GLRenderer::drawMeshes(const RenderFrameParams& params, bool wireframe,
         glUniform3fv(uTransmissionColor_, 1, p.transmissionColor);
         glUniform1f(uTransmissionDepth_, p.transmissionDepth);
         glUniform3fv(uTransmissionScatter_, 1, p.transmissionScatter);
+        glUniform1f(uTransmissionScatterAnisotropy_,
+                    p.transmissionScatterAnisotropy);
         glUniform1f(uVolumeDensity_, p.volumeDensity);
         glUniform3fv(uVolumeAlbedo_, 1, p.volumeAlbedo);
         glUniform3fv(uVolumeEmission_, 1, p.volumeEmission);
@@ -3870,12 +3891,31 @@ void GLRenderer::drawMeshes(const RenderFrameParams& params, bool wireframe,
                             uHasOcclusionTex_, uOcclusionTexIsUdim_);
         glActiveTexture(GL_TEXTURE0);
       }
-      // Native MaterialX graph upload. Keep graph images in a separate high
-      // texture-unit range so semantic bindings remain valid for mixed graphs.
-      // UDIM/over-limit graphs deliberately use the existing baked fallback.
+      // Native MaterialX graph upload. Keep ordinary graph images in a separate
+      // high texture-unit range so semantic bindings remain valid for mixed
+      // graphs. A graph UDIM image reuses the matching semantic UDIM array route
+      // (GL 3.3 has no portable bindless sampler); graph-only UDIMs use the
+      // deterministic semantic fallback.
       {
         const MaterialXGraphRuntimeCPU& graph = mat.materialXGraph;
         std::vector<int> graphTextureIds;
+        std::array<int, 8> graphUdimRoutes{};
+        graphUdimRoutes.fill(-1);
+        const int graphCoreSlots[7] = {
+            mat.baseColorTex, mat.metallicTex, mat.normalTex, mat.opacityTex,
+            mat.emissiveTex, mat.roughnessTex, mat.occlusionTex};
+        auto graphTextureIsUdim = [&](int slot) {
+          return slot >= 0 && static_cast<size_t>(slot) < textures_.size() &&
+                 textures_[static_cast<size_t>(slot)].isUdim &&
+                 textures_[static_cast<size_t>(slot)].arrayTex != 0;
+        };
+        auto graphUdimRoute = [&](int slot) {
+          for (int route = 0; route < 7; ++route) {
+            if (graphCoreSlots[route] == slot &&
+                graphTextureIsUdim(slot)) return route;
+          }
+          return -1;
+        };
         // The native graph interpreter is for MaterialX/OpenPBR graphs. A
         // UsdPreviewSurface network is already lowered into the semantic slots
         // above (including its named primvar reader); interpreting its retained
@@ -3884,12 +3924,25 @@ void GLRenderer::drawMeshes(const RenderFrameParams& params, bool wireframe,
                            graph.nodes.size() <= 64;
         if (graphUsable) {
           for (const MaterialXGraphNodeCPU& node : graph.nodes) {
-            if (node.isUdim) { graphUsable = false; break; }
             if (node.textureId < 0) continue;
             if (std::find(graphTextureIds.begin(), graphTextureIds.end(),
                           node.textureId) == graphTextureIds.end()) {
               graphTextureIds.push_back(node.textureId);
-              if (graphTextureIds.size() > 8) { graphUsable = false; break; }
+              // The GL 3.3 shader reserves four ordinary graph samplers so it
+              // stays within the 32-fragment-sampler limit after semantic,
+              // UDIM, shadow, and Ptex bindings are linked. Vulkan supports
+              // the full eight-image graph budget independently.
+              if (graphTextureIds.size() > 4) { graphUsable = false; break; }
+            }
+            const bool nodeUdim = node.isUdim ||
+                                  graphTextureIsUdim(node.textureId);
+            if (nodeUdim) {
+              const size_t local = static_cast<size_t>(
+                  std::find(graphTextureIds.begin(), graphTextureIds.end(),
+                            node.textureId) - graphTextureIds.begin());
+              const int route = graphUdimRoute(node.textureId);
+              if (route < 0) { graphUsable = false; break; }
+              graphUdimRoutes[local] = route;
             }
           }
         }
@@ -3898,20 +3951,27 @@ void GLRenderer::drawMeshes(const RenderFrameParams& params, bool wireframe,
           GLuint tex = whiteTex_;
           if (graphUsable && i < static_cast<int>(graphTextureIds.size())) {
             const int slot = graphTextureIds[static_cast<size_t>(i)];
-            if (slot >= 0 && static_cast<size_t>(slot) < textures_.size() &&
-                textures_[static_cast<size_t>(slot)].tex2d)
+            if (graphUdimRoutes[static_cast<size_t>(i)] >= 0) {
+              // The corresponding semantic sampler2DArray was bound above.
+              tex = whiteTex_;
+            } else if (slot >= 0 && static_cast<size_t>(slot) < textures_.size() &&
+                       textures_[static_cast<size_t>(slot)].tex2d)
               tex = textures_[static_cast<size_t>(slot)].tex2d;
             else
               graphUsable = false;
           }
           glBindTexture(GL_TEXTURE_2D, tex);
         }
+        if (uGraphUdimRoutes_ >= 0)
+          glUniform1iv(uGraphUdimRoutes_, 8, graphUdimRoutes.data());
         glUniform1i(uGraphUsable_, graphUsable ? 1 : 0);
         glUniform1i(uGraphNodeCount_, graphUsable ? static_cast<GLint>(graph.nodes.size()) : 0);
-        glUniform4iv(uGraphOutputs0_, 1, graph.output.data());
-        glUniform2i(uGraphOutputs1_, graph.output[4], graph.output[5]);
-        glUniform2i(uGraphOutputs2_, graph.output[6], graph.output[7]);
-        glUniform1i(uGraphOutputs3_, graph.output[8]);
+        std::array<GLint, MaterialXGraphRuntimeCPU::kOutputCount> graphOutputs{};
+        for (size_t i = 0; i < graphOutputs.size(); ++i)
+          graphOutputs[i] = graph.output[i];
+        glUniform1iv(uGraphOutputs_,
+                     static_cast<GLsizei>(graphOutputs.size()),
+                     graphOutputs.data());
         if (graphUsable) {
           std::vector<GLfloat> n0(graph.nodes.size() * 4, 0.0f);
           std::vector<GLfloat> n1(graph.nodes.size() * 4, 0.0f);
@@ -3938,12 +3998,16 @@ void GLRenderer::drawMeshes(const RenderFrameParams& params, bool wireframe,
                           ? -1
                           : static_cast<int>(it - graphTextureIds.begin());
             }
-            n4[i * 4 + 0] = static_cast<float>(local);
+            const bool nodeUdim = local >= 0 &&
+                                  graphUdimRoutes[static_cast<size_t>(local)] >= 0;
+            n4[i * 4 + 0] = nodeUdim ? -static_cast<float>(local + 1)
+                                     : static_cast<float>(local);
             n4[i * 4 + 1] = node.uvScale[0];
             n4[i * 4 + 2] = node.uvScale[1];
             n4[i * 4 + 3] = node.uvOffset[0];
             n5[i * 4 + 0] = node.uvOffset[1];
             n5[i * 4 + 1] = node.value[2][3];
+            n5[i * 4 + 2] = nodeUdim ? static_cast<float>(node.textureId) : -1.0f;
           }
           glUniform4fv(uGraphNode0_, static_cast<GLsizei>(graph.nodes.size()), n0.data());
           glUniform4fv(uGraphNode1_, static_cast<GLsizei>(graph.nodes.size()), n1.data());
@@ -4039,10 +4103,6 @@ void GLRenderer::drawMeshes(const RenderFrameParams& params, bool wireframe,
       glUniform1i(iSkinningEnabled_, instSkinOn ? 1 : 0);
       glUniform1i(iBoneTexWidth_, boneTexWidth_ > 0 ? boneTexWidth_ : 4);
       glUniform1i(iBoneMatrixCount_, boneMatrixCount_);
-      if (!mesh.jointVbo) {  // no skin attrs: constant zero weights
-        glVertexAttribI4ui(6, 0, 0, 0, 0);
-        glVertexAttrib4f(7, 0.0f, 0.0f, 0.0f, 0.0f);
-      }
       // Only touch cull state on a transition: across tens of thousands of
       // prototypes the back-face cull flag almost never changes, so the per-draw
       // glEnable/glDisable/glCullFace was pure redundant driver traffic.
@@ -4053,13 +4113,20 @@ void GLRenderer::drawMeshes(const RenderFrameParams& params, bool wireframe,
         cullState = wantCull;
       }
       glBindVertexArray(mesh.vao);
+      if (!mesh.jointVbo) {  // no skin attrs: constant zero weights
+        glVertexAttribI4ui(6, 0, 0, 0, 0);
+        glVertexAttrib4f(7, 0.0f, 0.0f, 0.0f, 0.0f);
+      }
       // Constant per-draw color when there is no per-instance color array (the
       // generic vertex-attribute value feeds aColor for every instance).
-      if (!mesh.hasInstanceColors) glVertexAttrib3fv(9, mesh.flatColor);
+      if (!mesh.hasInstanceColors) glVertexAttrib4f(
+          9, mesh.flatColor[0], mesh.flatColor[1], mesh.flatColor[2], 1.0f);
+      if (!mesh.vertexColorVbo) {
+        // Attribute 10 is the per-vertex color input of the instanced shader;
+        // keep its generic fallback local to this VAO/draw as well.
+        glVertexAttrib4f(10, 1.0f, 1.0f, 1.0f, 1.0f);
+      }
       if (!mesh.hasInstanceOpacities) glVertexAttrib1f(11, mesh.flatOpacity);
-      // Default per-vertex color to white when the prototype has none (the VAO
-      // supplies attrib 10 from vertexColorVbo otherwise).
-      if (!mesh.vertexColorVbo) glVertexAttrib4f(10, 1.0f, 1.0f, 1.0f, 1.0f);
       // GPU blendshape morph for a morphed prototype: bind its delta/coeff/chan
       // texture-buffers (units 8/9/10, matching the instanced program's samplers)
       // and enable the in-shader morph. Same as the non-instanced material pass.

@@ -414,21 +414,39 @@ std::string MaterialDescriptorKey(const DrawMaterialCPU& material) {
   for (const MaterialXGraphNodeCPU& node : material.materialXGraph.nodes) {
     key.append(reinterpret_cast<const char*>(&node.textureId),
                sizeof(node.textureId));
+    const uint8_t graphUdim = node.isUdim ? 1u : 0u;
+    key.append(reinterpret_cast<const char*>(&graphUdim), sizeof(graphUdim));
   }
-  const uint32_t graphUdimMask =
-      (material.baseColorSample.isUdim ? 1u : 0u) |
-      (material.metallicSample.isUdim ? 2u : 0u) |
-      (material.roughnessSample.isUdim ? 4u : 0u) |
-      (material.normalSample.isUdim ? 8u : 0u) |
-      (material.emissiveSample.isUdim ? 16u : 0u) |
-      (material.opacitySample.isUdim ? 32u : 0u) |
-      (material.occlusionSample.isUdim ? 64u : 0u) |
-      (material.specularColorSample.isUdim ? 128u : 0u) |
-      (material.coatWeightSample.isUdim ? 256u : 0u) |
-      (material.coatColorSample.isUdim ? 512u : 0u) |
-      (material.coatRoughnessSample.isUdim ? 1024u : 0u) |
-      (material.coatNormalSample.isUdim ? 2048u : 0u);
-  key.append(reinterpret_cast<const char*>(&graphUdimMask), sizeof(graphUdimMask));
+  const std::array<const DrawTexSampleCPU*, 13> samples = {
+      &material.baseColorSample,      &material.metallicSample,
+      &material.roughnessSample,      &material.normalSample,
+      &material.coatNormalSample,     &material.emissiveSample,
+      &material.opacitySample,        &material.occlusionSample,
+      &material.specularColorSample,  &material.coatWeightSample,
+      &material.coatColorSample,      &material.coatRoughnessSample,
+      &material.displacementSample};
+  const int textureIdsForSamples[] = {
+      material.baseColorTex,     material.metallicTex,
+      material.roughnessTex,     material.normalTex,
+      material.coatNormalTex,    material.emissiveTex,
+      material.opacityTex,       material.occlusionTex,
+      material.specularColorTex, material.coatWeightTex,
+      material.coatColorTex,     material.coatRoughnessTex,
+      material.displacementTex};
+  for (size_t i = 0; i < samples.size(); ++i) {
+    const DrawTexSampleCPU& sample = *samples[i];
+    key.append(reinterpret_cast<const char*>(&textureIdsForSamples[i]),
+               sizeof(textureIdsForSamples[i]));
+    const int sampleMeta[] = {
+        sample.channel,
+        sample.uvSet,
+        static_cast<int>(sample.wrapS),
+        static_cast<int>(sample.wrapT),
+        static_cast<int>(sample.colorSpace),
+        sample.isUdim ? 1 : 0,
+        sample.isPtex ? 1 : 0};
+    key.append(reinterpret_cast<const char*>(sampleMeta), sizeof(sampleMeta));
+  }
   return key;
 }
 
@@ -4213,7 +4231,7 @@ bool VulkanRenderer::createDescriptorInfra(std::string* err) {
 
   // Raster set 3: per-material texture scale/bias plus the compact MaterialX
   // graph block, both indexed by pc.matId.
-  VkDescriptorSetLayoutBinding mb[2]{};
+  VkDescriptorSetLayoutBinding mb[3]{};
   mb[0].binding = 0;
   mb[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   mb[0].descriptorCount = 1;
@@ -4223,15 +4241,19 @@ bool VulkanRenderer::createDescriptorInfra(std::string* err) {
   mb[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   mb[1].descriptorCount = 1;
   mb[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+  mb[2].binding = 2;
+  mb[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  mb[2].descriptorCount = 1;
+  mb[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
   VkDescriptorSetLayoutCreateInfo mlci{};
   mlci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  mlci.bindingCount = 2;
+  mlci.bindingCount = 3;
   mlci.pBindings = mb;
   VK_CHECK(vkCreateDescriptorSetLayout(device_, &mlci, nullptr, &dispMatSetLayout_),
            "displacement-material set layout");
   VkDescriptorPoolSize mps{};
   mps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  mps.descriptorCount = 2;
+  mps.descriptorCount = 3;
   VkDescriptorPoolCreateInfo mpci{};
   mpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   mpci.maxSets = 1;
@@ -4257,6 +4279,18 @@ bool VulkanRenderer::createDescriptorInfra(std::string* err) {
       dispMatCapacity_ = 1;
     }
   }
+  DrawMaterialCPU pbrDefault;
+  std::vector<float> pbrInit(kVkLightRtOpenPBRFloats, 0.0f);
+  PackLightRtOpenPBR(pbrDefault, pbrInit.data());
+  const VkDeviceSize pbrBytes =
+      static_cast<VkDeviceSize>(pbrInit.size() * sizeof(float));
+  if (!createHostBuffer(pbrBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                        pbrInit.data(), &rasterMatPbrBuf_, &rasterMatPbrMem_,
+                        false, false, &rasterMatPbrMapped_)) {
+    if (err && err->empty())
+      *err = "raster OpenPBR material buffer allocation failed";
+    return false;
+  }
   if (dispMatSsbo_) {
     VkDescriptorSetAllocateInfo mai{};
     mai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -4280,6 +4314,13 @@ bool VulkanRenderer::createDescriptorInfra(std::string* err) {
       // A valid fallback keeps the descriptor complete before the first scene
       // upload; updateMaterialTables replaces it with the graph buffer.
       vkUpdateDescriptorSets(device_, 1, &gw, 0, nullptr);
+      VkDescriptorBufferInfo pbi{};
+      pbi.buffer = rasterMatPbrBuf_ ? rasterMatPbrBuf_ : dispMatSsbo_;
+      pbi.range = rasterMatPbrBuf_ ? pbrBytes : dispMatBytes;
+      VkWriteDescriptorSet pw = mw;
+      pw.dstBinding = 2;
+      pw.pBufferInfo = &pbi;
+      vkUpdateDescriptorSets(device_, 1, &pw, 0, nullptr);
     }
   }
 
@@ -4625,15 +4666,72 @@ void VulkanRenderer::updateMaterialDescriptor(size_t materialId) {
     textureSlots[32 + i] = -1;
     textureSlots[40 + i] = -1;
   }
+  const std::array<const DrawTexSampleCPU*, 13> materialSamples = {
+      &material.baseColorSample,      &material.metallicSample,
+      &material.roughnessSample,      &material.normalSample,
+      &material.coatNormalSample,     &material.emissiveSample,
+      &material.opacitySample,        &material.occlusionSample,
+      &material.specularColorSample,  &material.coatWeightSample,
+      &material.coatColorSample,      &material.coatRoughnessSample,
+      &material.displacementSample};
+  const int materialSampleTextureIds[] = {
+      material.baseColorTex,     material.metallicTex,
+      material.roughnessTex,     material.normalTex,
+      material.coatNormalTex,    material.emissiveTex,
+      material.opacityTex,       material.occlusionTex,
+      material.specularColorTex, material.coatWeightTex,
+      material.coatColorTex,     material.coatRoughnessTex,
+      material.displacementTex};
+  auto sampleForTexture = [&](int slot) -> const DrawTexSampleCPU* {
+    for (size_t i = 0; i < materialSamples.size(); ++i) {
+      if (materialSampleTextureIds[i] == slot) return materialSamples[i];
+    }
+    return nullptr;
+  };
+  auto sampleForBinding = [&](uint32_t binding) -> const DrawTexSampleCPU* {
+    switch (binding) {
+      case 0:
+      case 4: return &material.baseColorSample;
+      case 1:
+      case 6: return &material.metallicSample;
+      case 2:
+      case 8: return &material.emissiveSample;
+      case 3:
+      case 7: return &material.normalSample;
+      case 9:
+      case 10: return &material.opacitySample;
+      case 11:
+      case 15: return &material.roughnessSample;
+      case 16:
+      case 31: return &material.displacementSample;
+      case 17:
+      case 18: return &material.occlusionSample;
+      case 20:
+      case 26: return &material.specularColorSample;
+      case 21:
+      case 27: return &material.coatWeightSample;
+      case 22:
+      case 28: return &material.coatColorSample;
+      case 23:
+      case 29: return &material.coatRoughnessSample;
+      case 24:
+      case 30: return &material.coatNormalSample;
+      default:
+        if ((binding >= 32 && binding < 40) ||
+            (binding >= 40 && binding < 48)) {
+          return sampleForTexture(textureSlots[binding]);
+        }
+        return nullptr;
+    }
+  };
   VkDescriptorImageInfo infos[kMaterialBindingCount]{};
   VkWriteDescriptorSet writes[kMaterialBindingCount]{};
   for (uint32_t i = 0; i < kMaterialBindingCount; ++i) {
     infos[i].sampler = sampler_;
-    const int slot = textureSlots[i];
-    if (slot >= 0 && static_cast<size_t>(slot) < rtTexturesCpu_.size()) {
-      const DrawTextureCPU& tex = rtTexturesCpu_[static_cast<size_t>(slot)];
-      const int s = std::max(0, std::min(3, tex.wrapS));
-      const int t = std::max(0, std::min(3, tex.wrapT));
+    const DrawTexSampleCPU* sample = sampleForBinding(i);
+    if (sample) {
+      const int s = std::max(0, std::min(3, static_cast<int>(sample->wrapS)));
+      const int t = std::max(0, std::min(3, static_cast<int>(sample->wrapT)));
       VkSampler materialSampler =
           materialSamplers_[static_cast<size_t>(s * 4 + t)];
       if (materialSampler) infos[i].sampler = materialSampler;
@@ -6623,8 +6721,14 @@ bool VulkanRenderer::createHostBuffer(VkDeviceSize size, VkBufferUsageFlags usag
     return false;
   }
   std::memcpy(mapped, data, static_cast<size_t>(size));
-  vkUnmapMemory(device_, *mem);
-  if (mappedOut) *mappedOut = nullptr;
+  if (mappedOut) {
+    // Callers that request a mapped pointer own the mapping until the buffer is
+    // retired. This is used for scene-stable SSBOs whose contents are rewritten
+    // without rebuilding a descriptor or stalling the device.
+    *mappedOut = mapped;
+  } else {
+    vkUnmapMemory(device_, *mem);
+  }
   if (timeit) {
     g_chb.map += NowS() - ta;
     if ((++g_chb.n % 10000) == 0)
@@ -6874,8 +6978,13 @@ void VulkanRenderer::destroyScene() {
   if (rtMatTexParamMem_) { vkFreeMemory(device_, rtMatTexParamMem_, nullptr); rtMatTexParamMem_ = VK_NULL_HANDLE; }
   if (rtMatGraphBuf_) { vkDestroyBuffer(device_, rtMatGraphBuf_, nullptr); rtMatGraphBuf_ = VK_NULL_HANDLE; }
   if (rtMatGraphMem_) { vkFreeMemory(device_, rtMatGraphMem_, nullptr); rtMatGraphMem_ = VK_NULL_HANDLE; }
+  if (rasterMatGraphMapped_ && rasterMatGraphMem_) {
+    vkUnmapMemory(device_, rasterMatGraphMem_);
+  }
   if (rasterMatGraphBuf_) { vkDestroyBuffer(device_, rasterMatGraphBuf_, nullptr); rasterMatGraphBuf_ = VK_NULL_HANDLE; }
   if (rasterMatGraphMem_) { vkFreeMemory(device_, rasterMatGraphMem_, nullptr); rasterMatGraphMem_ = VK_NULL_HANDLE; }
+  rasterMatGraphMapped_ = nullptr;
+  rasterMatGraphCapacity_ = 0;
   if (instInfoBuf_) { vkDestroyBuffer(device_, instInfoBuf_, nullptr); instInfoBuf_ = VK_NULL_HANDLE; }
   if (instInfoMem_) { vkFreeMemory(device_, instInfoMem_, nullptr); instInfoMem_ = VK_NULL_HANDLE; }
   if (rtPointBuf_) { vkDestroyBuffer(device_, rtPointBuf_, nullptr); rtPointBuf_ = VK_NULL_HANDLE; }
@@ -7147,16 +7256,25 @@ void VulkanRenderer::updateMaterialTables(
     matDispConst_[i] = materials[i].displacementConst;
   }
 
+  rasterMatPbr_.assign(rasterMaterialCount * kVkLightRtOpenPBRFloats, 0.0f);
   for (size_t canonical = 0;
        canonical < rasterCanonicalRepresentatives_.size(); ++canonical) {
     const size_t logical = static_cast<size_t>(
         rasterCanonicalRepresentatives_[canonical]);
     if (logical >= materials.size()) continue;
+    DrawMaterialCPU packed = materials[logical];
+    PackLightRtOpenPBR(
+        packed, &rasterMatPbr_[canonical * kVkLightRtOpenPBRFloats]);
+    if (rasterMatPbrMapped_ && canonical < dispMatCapacity_) {
+      std::memcpy(static_cast<float*>(rasterMatPbrMapped_) +
+                      canonical * kVkLightRtOpenPBRFloats,
+                  &rasterMatPbr_[canonical * kVkLightRtOpenPBRFloats],
+                  kVkLightRtOpenPBRFloats * sizeof(float));
+    }
     // Per-canonical-material texture sampling params -> raster set 3 SSBO.
     if (dispMatMapped_ && canonical < dispMatCapacity_) {
       float* dst = static_cast<float*>(dispMatMapped_) +
                    canonical * kVkMatTexParamFloats;
-      DrawMaterialCPU packed = materials[logical];
       auto patchPtexOffset = [&](DrawTexSampleCPU* sample) {
         if (!sample || !sample->isPtex || sample->tex < 0 ||
             static_cast<size_t>(sample->tex) >= ptexRectOffsets_.size()) return;
@@ -7187,26 +7305,76 @@ void VulkanRenderer::updateMaterialTables(
     PackRasterMaterialXGraphRuntime(
         materials[logical], &rasterMatGraph_[i * kRtMaterialGraphFloats]);
   }
-  if (rasterMatGraphBuf_) {
-    vkDeviceWaitIdle(device_);
-    vkDestroyBuffer(device_, rasterMatGraphBuf_, nullptr);
+  const size_t graphFloats = std::max<size_t>(rasterMatGraph_.size(), 1);
+  bool graphReady = rasterMatGraphMapped_ &&
+                    graphFloats <= rasterMatGraphCapacity_;
+  if (!graphReady) {
+    if (graphFloats > std::numeric_limits<size_t>::max() / sizeof(float)) {
+      LOGE("Vulkan raster MaterialX graph table size overflows");
+    } else {
+      VkPhysicalDeviceProperties props{};
+      vkGetPhysicalDeviceProperties(phys_, &props);
+      const VkDeviceSize graphBytes = static_cast<VkDeviceSize>(
+          graphFloats * sizeof(float));
+      if (graphBytes > props.limits.maxStorageBufferRange) {
+        LOGE("Vulkan raster MaterialX graph table exceeds maxStorageBufferRange");
+      } else {
+        // Graph records are already compact; retain exactly the required range
+        // so shader bounds reflect the validated material count. Reuse this
+        // allocation for all subsequent edits to the same scene.
+        const size_t newCapacity = graphFloats;
+        const VkDeviceSize grownBytes = static_cast<VkDeviceSize>(
+            newCapacity * sizeof(float));
+        std::vector<float> graphInitial(newCapacity, 0.0f);
+        std::copy(rasterMatGraph_.begin(), rasterMatGraph_.end(),
+                  graphInitial.begin());
+        VkBuffer newBuffer = VK_NULL_HANDLE;
+        VkDeviceMemory newMemory = VK_NULL_HANDLE;
+        void* newMapped = nullptr;
+        if (createHostBuffer(grownBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                             graphInitial.data(), &newBuffer, &newMemory,
+                             false, false, &newMapped) && newMapped) {
+          // A resize changes the descriptor's backing range. Retire the old
+          // buffer only after the previous frame is complete; the common
+          // same-sized scene update below never reaches this wait.
+          if (device_) vkDeviceWaitIdle(device_);
+          if (rasterMatGraphMapped_ && rasterMatGraphMem_)
+            vkUnmapMemory(device_, rasterMatGraphMem_);
+          if (rasterMatGraphBuf_)
+            vkDestroyBuffer(device_, rasterMatGraphBuf_, nullptr);
+          if (rasterMatGraphMem_)
+            vkFreeMemory(device_, rasterMatGraphMem_, nullptr);
+          rasterMatGraphBuf_ = newBuffer;
+          rasterMatGraphMem_ = newMemory;
+          rasterMatGraphMapped_ = newMapped;
+          rasterMatGraphCapacity_ = newCapacity;
+          graphReady = true;
+          if (dispMatSet_) {
+            VkDescriptorBufferInfo graphInfo{rasterMatGraphBuf_, 0,
+                                             static_cast<VkDeviceSize>(
+                                                 rasterMatGraphCapacity_ *
+                                                 sizeof(float))};
+            VkWriteDescriptorSet graphWrite{};
+            graphWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            graphWrite.dstSet = dispMatSet_;
+            graphWrite.dstBinding = 1;
+            graphWrite.descriptorCount = 1;
+            graphWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            graphWrite.pBufferInfo = &graphInfo;
+            vkUpdateDescriptorSets(device_, 1, &graphWrite, 0, nullptr);
+          }
+        } else {
+          if (newMapped && newMemory) vkUnmapMemory(device_, newMemory);
+          if (newBuffer) vkDestroyBuffer(device_, newBuffer, nullptr);
+          if (newMemory) vkFreeMemory(device_, newMemory, nullptr);
+          LOGE("Vulkan raster MaterialX graph buffer allocation failed");
+        }
+      }
+    }
   }
-  if (rasterMatGraphMem_) vkFreeMemory(device_, rasterMatGraphMem_, nullptr);
-  rasterMatGraphBuf_ = VK_NULL_HANDLE;
-  rasterMatGraphMem_ = VK_NULL_HANDLE;
-  if (createHostBuffer(rasterMatGraph_.size() * sizeof(float),
-                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                       rasterMatGraph_.data(), &rasterMatGraphBuf_,
-                       &rasterMatGraphMem_) && dispMatSet_) {
-    VkDescriptorBufferInfo graphInfo{rasterMatGraphBuf_, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet graphWrite{};
-    graphWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    graphWrite.dstSet = dispMatSet_;
-    graphWrite.dstBinding = 1;
-    graphWrite.descriptorCount = 1;
-    graphWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    graphWrite.pBufferInfo = &graphInfo;
-    vkUpdateDescriptorSets(device_, 1, &graphWrite, 0, nullptr);
+  if (graphReady && rasterMatGraphMapped_) {
+    std::memcpy(rasterMatGraphMapped_, rasterMatGraph_.data(),
+                rasterMatGraph_.size() * sizeof(float));
   }
 
   const size_t materialCount = rasterMaterialCount;
@@ -7283,7 +7451,9 @@ void VulkanRenderer::updateMaterialTables(
 
 bool VulkanRenderer::ensureRasterMaterialCapacity(size_t materialCount) {
   const size_t wanted = std::max<size_t>(materialCount, 1);
-  if (dispMatMapped_ && wanted <= dispMatCapacity_) return true;
+  if (dispMatMapped_ && rasterMatPbrMapped_ && wanted <= dispMatCapacity_) {
+    return true;
+  }
   size_t floatCount = 0;
   if (wanted > std::numeric_limits<size_t>::max() / kVkMatTexParamFloats) {
     return false;
@@ -7296,6 +7466,14 @@ bool VulkanRenderer::ensureRasterMaterialCapacity(size_t materialCount) {
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(phys_, &props);
   if (bytes > props.limits.maxStorageBufferRange) return false;
+  if (wanted > std::numeric_limits<size_t>::max() / kVkLightRtOpenPBRFloats ||
+      wanted * kVkLightRtOpenPBRFloats >
+          std::numeric_limits<size_t>::max() / sizeof(float)) {
+    return false;
+  }
+  const VkDeviceSize pbrBytes = static_cast<VkDeviceSize>(
+      wanted * kVkLightRtOpenPBRFloats * sizeof(float));
+  if (pbrBytes > props.limits.maxStorageBufferRange) return false;
 
   std::vector<float> initial(floatCount, 0.0f);
   for (size_t i = 0; i < wanted; ++i) {
@@ -7305,11 +7483,30 @@ bool VulkanRenderer::ensureRasterMaterialCapacity(size_t materialCount) {
   VkDeviceMemory memory = VK_NULL_HANDLE;
   void* mapped = nullptr;
   if (!createHostBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                        initial.data(), &buffer, &memory) ||
-      vkMapMemory(device_, memory, 0, bytes, 0, &mapped) != VK_SUCCESS ||
-      !mapped) {
+                        initial.data(), &buffer, &memory, false, false,
+                        &mapped) || !mapped) {
     if (buffer) vkDestroyBuffer(device_, buffer, nullptr);
     if (memory) vkFreeMemory(device_, memory, nullptr);
+    return false;
+  }
+
+  std::vector<float> pbrInitial(wanted * kVkLightRtOpenPBRFloats, 0.0f);
+  DrawMaterialCPU pbrDefault;
+  for (size_t i = 0; i < wanted; ++i) {
+    PackLightRtOpenPBR(pbrDefault,
+                       pbrInitial.data() + i * kVkLightRtOpenPBRFloats);
+  }
+  VkBuffer pbrBuffer = VK_NULL_HANDLE;
+  VkDeviceMemory pbrMemory = VK_NULL_HANDLE;
+  void* pbrMapped = nullptr;
+  if (!createHostBuffer(pbrBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                        pbrInitial.data(), &pbrBuffer, &pbrMemory, false,
+                        false, &pbrMapped) || !pbrMapped) {
+    if (pbrBuffer) vkDestroyBuffer(device_, pbrBuffer, nullptr);
+    if (pbrMemory) vkFreeMemory(device_, pbrMemory, nullptr);
+    if (mapped && memory) vkUnmapMemory(device_, memory);
+    vkDestroyBuffer(device_, buffer, nullptr);
+    vkFreeMemory(device_, memory, nullptr);
     return false;
   }
 
@@ -7317,10 +7514,16 @@ bool VulkanRenderer::ensureRasterMaterialCapacity(size_t materialCount) {
   if (dispMatMapped_) vkUnmapMemory(device_, dispMatSsboMem_);
   if (dispMatSsbo_) vkDestroyBuffer(device_, dispMatSsbo_, nullptr);
   if (dispMatSsboMem_) vkFreeMemory(device_, dispMatSsboMem_, nullptr);
+  if (rasterMatPbrMapped_) vkUnmapMemory(device_, rasterMatPbrMem_);
+  if (rasterMatPbrBuf_) vkDestroyBuffer(device_, rasterMatPbrBuf_, nullptr);
+  if (rasterMatPbrMem_) vkFreeMemory(device_, rasterMatPbrMem_, nullptr);
   dispMatSsbo_ = buffer;
   dispMatSsboMem_ = memory;
   dispMatMapped_ = mapped;
   dispMatCapacity_ = wanted;
+  rasterMatPbrBuf_ = pbrBuffer;
+  rasterMatPbrMem_ = pbrMemory;
+  rasterMatPbrMapped_ = pbrMapped;
 
   if (dispMatSet_) {
     VkDescriptorBufferInfo info{};
@@ -7333,6 +7536,12 @@ bool VulkanRenderer::ensureRasterMaterialCapacity(size_t materialCount) {
     write.descriptorCount = 1;
     write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     write.pBufferInfo = &info;
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    VkDescriptorBufferInfo pbrInfo{};
+    pbrInfo.buffer = rasterMatPbrBuf_;
+    pbrInfo.range = pbrBytes;
+    write.dstBinding = 2;
+    write.pBufferInfo = &pbrInfo;
     vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
   }
   return true;
@@ -16267,6 +16476,10 @@ void VulkanRenderer::shutdown() {
   if (dispMatSetLayout_) { vkDestroyDescriptorSetLayout(device_, dispMatSetLayout_, nullptr); dispMatSetLayout_ = VK_NULL_HANDLE; }
   if (dispMatSsbo_) { vkDestroyBuffer(device_, dispMatSsbo_, nullptr); dispMatSsbo_ = VK_NULL_HANDLE; }
   if (dispMatSsboMem_) { vkFreeMemory(device_, dispMatSsboMem_, nullptr); dispMatSsboMem_ = VK_NULL_HANDLE; dispMatMapped_ = nullptr; dispMatCapacity_ = 0; }
+  if (rasterMatPbrMapped_ && rasterMatPbrMem_) vkUnmapMemory(device_, rasterMatPbrMem_);
+  if (rasterMatPbrBuf_) { vkDestroyBuffer(device_, rasterMatPbrBuf_, nullptr); rasterMatPbrBuf_ = VK_NULL_HANDLE; }
+  if (rasterMatPbrMem_) { vkFreeMemory(device_, rasterMatPbrMem_, nullptr); rasterMatPbrMem_ = VK_NULL_HANDLE; }
+  rasterMatPbrMapped_ = nullptr;
   if (drawMetaBuf_) { vkDestroyBuffer(device_, drawMetaBuf_, nullptr); drawMetaBuf_ = VK_NULL_HANDLE; }
   if (drawMetaBufMem_) { vkFreeMemory(device_, drawMetaBufMem_, nullptr); drawMetaBufMem_ = VK_NULL_HANDLE; }
   if (drawMetaPool_) { vkDestroyDescriptorPool(device_, drawMetaPool_, nullptr); drawMetaPool_ = VK_NULL_HANDLE; }
